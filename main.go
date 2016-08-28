@@ -2,210 +2,135 @@ package main
 
 
 import (
-	"github.com/gordonklaus/portaudio"
-	"strings"
-	"encoding/binary"
 	"encoding/base64"
-
+	"io/ioutil"
+	"fmt"
+	"log"
 	"os"
 	"os/exec"
-	"io/ioutil"
 
-	"time"
-	"fmt"
-
+	"github.com/howeyc/fsnotify"
 	context "golang.org/x/net/context"
 	speech "google.golang.org/api/speech/v1beta1"
-//	storage "google.golang.org/api/storage/v1"
 	google "golang.org/x/oauth2/google"
 )
 
 var endpoint = "https://speech.googleapis.com/v1beta1/speech:syncrecognize"
 var scope = speech.CloudPlatformScope
 var bucketName = "willowbot"
+var wd = ""
 
 func main() {
-	ticker := time.NewTicker(6 * time.Second)
-	quit := make(chan struct{})
-	for {
-		select {
-			case <- ticker.C:
-				var flacFile = "/tmp/sound.flac"
-				fileToParse := ListenForCommand()
-
-				fmt.Println(fmt.Sprintf("/usr/bin/avconv -i %v %v", fileToParse, flacFile))
-				cmd := exec.Command("/usr/bin/avconv", "-y", "-i", fileToParse, flacFile)
-				_, err := cmd.CombinedOutput()
-				chk(err)
-//				var fileToParse = "/home/calum/recording.flac"
-				bytesThing, err := ioutil.ReadFile(flacFile)
-				chk(err)
-				encoded := base64.StdEncoding.EncodeToString(bytesThing)
-				client, err := google.DefaultClient(context.Background(), scope)
-				chk(err)
-
-//				storageSvc, err := storage.New(client)
-//				chk(err)
-
-				speechSvc, err := speech.New(client)
-				chk(err)
-
-//				object := &storage.Object{Name: "willow-dev"}
-//				file, err := os.Open(fileToParse)
-//				chk(err)
-
-//				res, err := storageSvc.Objects.Insert(bucketName, object).Media(file).Do()
-//				chk(err)
-//				fmt.Println(res.SelfLink)
-//				var location = "gs://willowbot/willow-dev"
-
-				syncRequest := speech.SyncRecognizeRequest{
-					Audio: &speech.RecognitionAudio{
-						Content: string(encoded),
-					},
-					Config: &speech.RecognitionConfig{
-						Encoding: "FLAC",
-						LanguageCode: "en-GB",
-						MaxAlternatives: int64(10),
-						ProfanityFilter: false,
-						SampleRate: int64(44100),
-					},
-				}
-				resp, err := speechSvc.Speech.Syncrecognize(&syncRequest).Do()
-				fmt.Println(resp)
-				chk(err)
-
-				for _, r := range resp.Results{
-					for _, a := range r.Alternatives {
-						fmt.Println(a.Transcript)
-					}
-				}
-
-		// Cleanup
-//				chk(storageSvc.Objects.Delete(bucketName, "willow-dev").Do())
-
-			case <- quit:
-				ticker.Stop()
-				return
-		}
-	}
-}
-
-func chk (err error) {
+	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		panic(err)
-	}
-}
-
-
-func ListenForCommand() (fn string) {
-	var fileName = "/tmp/sound.aiff"
-	if !strings.HasSuffix(fileName, ".aiff") {
-		fileName += ".aiff"
+		log.Print(err)
 	}
 
-	f, err := os.Create(fileName)
-	chk(err)
+	// Google Gubbins.
+	client, err := google.DefaultClient(context.Background(), scope)
+  if err != nil {
+		log.Fatal(err)
+  }
 
-	_, err = f.WriteString("FORM")
-	chk(err)
-	chk(binary.Write(f, binary.BigEndian, int32(0)))
-	_, err = f.WriteString("AIFF")
-	chk(err)
-
-	_, err = f.WriteString("COMM")
-	chk(err)
-	chk(binary.Write(f, binary.BigEndian, int32(18)))                  //size
-  chk(binary.Write(f, binary.BigEndian, int16(1)))                   //channels
-	chk(binary.Write(f, binary.BigEndian, int32(0)))                   //number of samples
-	chk(binary.Write(f, binary.BigEndian, int16(32)))                  //bits per sample
-	_, err = f.Write([]byte{0x40, 0x0e, 0xac, 0x44, 0, 0, 0, 0, 0, 0}) //80-bit sample rate 44100
-	chk(err)
-
-	// sound chunk
-	_, err = f.WriteString("SSND")
-	chk(err)
-	chk(binary.Write(f, binary.BigEndian, int32(0))) //size
-	chk(binary.Write(f, binary.BigEndian, int32(0))) //offset
-	chk(binary.Write(f, binary.BigEndian, int32(0))) //block
-	nSamples := 0
-	defer func() {
-		// fill in missing sizes
-		totalBytes := 4 + 8 + 18 + 8 + 8 + 4*nSamples
-		_, err = f.Seek(4, 0)
-		chk(err)
-		chk(binary.Write(f, binary.BigEndian, int32(totalBytes)))
-		_, err = f.Seek(22, 0)
-		chk(err)
-		chk(binary.Write(f, binary.BigEndian, int32(nSamples)))
-		_, err = f.Seek(42, 0)
-		chk(err)
-		chk(binary.Write(f, binary.BigEndian, int32(4*nSamples+8)))
-		chk(f.Close())
-	}()
-
-	portaudio.Initialize()
-	defer portaudio.Terminate()
-	in := make([]int32, 64)
-
-	dev, err := portaudio.Devices()
-	chk(err)
-
-	var theDeviceToUse = &portaudio.DeviceInfo{}
-
-	for _, d := range dev {
-		if strings.Contains(d.Name, "hw:3,0") {
-			theDeviceToUse = d
-			break
-		}// Hardcoding
+  speechSvc, err := speech.New(client)
+  if err != nil {
+		log.Fatal(err)
 	}
 
-	var numInputChannels	= 1
-	var numOutputChannels = 0
-
-	var inDev, outDev *portaudio.DeviceInfo
-	if numInputChannels > 0 {
-		inDev = theDeviceToUse
-		chk(err)
-	}
-	if numOutputChannels > 0 {
-		outDev, err = portaudio.DefaultOutputDevice()
-		chk(err)
+	wd, err = os.Getwd()
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	p := portaudio.HighLatencyParameters(inDev, outDev)
-	p.Input.Channels = numInputChannels
-	p.Output.Channels = numOutputChannels
-	p.SampleRate = 44100
-	p.FramesPerBuffer = 44100
-
-	stream, err := portaudio.OpenStream(p, in)
-	chk(err)
-	defer stream.Close()
-
-	quit := make(chan struct{})
+	done := make(chan bool)
+	filesToProcess := make(chan string)
 
 	go func() {
-		fmt.Println("Recording")
-		time.Sleep(5 * time.Second)
-		fmt.Println("Closing Quit")
-		close(quit)
-	}()
-
-	chk(stream.Start())
-	Loop:
 		for {
 			select {
-				case <-quit:
-					fmt.Println("Quitting Recording Loop")
-					break Loop;
-				default:
-					chk(stream.Read())
-					chk(binary.Write(f, binary.BigEndian, in))
-					nSamples += len(in)
+			case ev := <-watcher.Event:
+				if !ev.IsCreate() {
+					break
+				}
+				fmt.Println(fmt.Sprintf("listing file %v", ev.Name))
+				filesToProcess <- ev.Name
+				fmt.Println(ev.Name)
+			case err :=<-watcher.Error:
+				log.Print(err)
 			}
 		}
-	chk(stream.Stop())
-	fmt.Println("End of listen")
-	return fileName
+	}()
+
+	err = watcher.Watch("output")
+	if err != nil {
+		log.Print(err)
+	}
+
+	// So basically we'll process these one at a time.
+	for {
+		toProcess := <-filesToProcess
+		fmt.Println(fmt.Sprintf("Beginning to Process %v",toProcess))
+		outcome := ProcessFile(toProcess, speechSvc)
+		if outcome == nil {
+			continue
+		}
+	}
+
+	<-done
+	watcher.Close()
+}
+
+var inProcessing = []string{}
+
+func ProcessFile(fileName string, speechSvc *speech.Service) []string {
+	// Check if we've already done this file.
+	for _, f := range inProcessing {
+		if f == fileName {
+			return nil  // We've already done it
+		}
+	}
+	cmdToRun := exec.Command("lsof", wd + "/" + fileName)
+	out, err := cmdToRun.CombinedOutput()
+	if err != nil {
+		log.Print(err)
+	}
+	fmt.Println(out)
+
+	for {}
+  bytesThing, err := ioutil.ReadFile(wd + "/" + fileName)
+  if err != nil {
+	  log.Print(err)
+  }
+	fmt.Println(bytesThing)
+  if len(bytesThing) <= 0 {
+	  log.Fatal(fmt.Sprintf("Empty File.. %v", wd + "/" + fileName))
+  }
+  encoded := base64.StdEncoding.EncodeToString(bytesThing)
+	fmt.Println("Making Request...")
+  syncRequest := speech.SyncRecognizeRequest{
+	  Audio: &speech.RecognitionAudio{
+	    Content: string(encoded),
+    },
+	  Config: &speech.RecognitionConfig{
+    Encoding: "FLAC",
+    LanguageCode: "en-GB",
+    MaxAlternatives: int64(10),
+    ProfanityFilter: false,
+    SampleRate: int64(16000),
+   },
+	}
+  resp, err := speechSvc.Speech.Syncrecognize(&syncRequest).Do()
+  if err != nil {
+		log.Print(err)
+		return nil
+  }
+
+	transcripts := []string{}
+  for _, r := range resp.Results{
+		for _, a := range r.Alternatives {
+			transcripts = append(transcripts, a.Transcript)
+    }
+  }
+
+	return transcripts
 }
